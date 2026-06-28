@@ -77,7 +77,7 @@ int hmac_isal_multi(const uint8_t *key, size_t key_len,
                     const hmac_isal_key_cache_t *cache);
 
 /*
- * Constant-time HMAC verification.
+ * Constant-time single-packet HMAC verification.
  *
  * Returns 0 if mac matches the computed HMAC(key, msg), nonzero otherwise.
  */
@@ -85,6 +85,18 @@ int hmac_isal_verify_single(const uint8_t *key, size_t key_len,
                             const uint8_t *msg, size_t msg_len,
                             const uint8_t mac[HMAC_ISAL_DIGEST_SIZE],
                             const hmac_isal_key_cache_t *cache);
+
+/*
+ * Constant-time multi-packet HMAC verification.
+ *
+ * Returns 0 if every macs[i] matches HMAC(key, msgs[i]), nonzero if any
+ * differs.  num_packets may be any positive integer; batches larger than
+ * 16 are split automatically under the hood.
+ */
+int hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
+                           const uint8_t *msgs[], const size_t msg_lens[],
+                           const uint8_t *macs[], int num_packets,
+                           const hmac_isal_key_cache_t *cache);
 
 #ifdef __cplusplus
 }

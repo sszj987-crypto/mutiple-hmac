@@ -268,6 +268,208 @@ static void run_large_batch_cached_test(void)
 
 /* ---------- main ---------- */
 
+#ifdef HMAC_ISAL_HAVE_OPENSSL
+
+#include <openssl/evp.h>
+
+/*
+ * Cross-check every RFC 4231 test vector against OpenSSL.
+ * Both the single-packet and cached paths must produce identical
+ * results to the reference implementation.
+ */
+static void run_openssl_single_cross_check(void)
+{
+    uint8_t key[256], data[512], expected[HMAC_ISAL_DIGEST_SIZE];
+    uint8_t computed[HMAC_ISAL_DIGEST_SIZE];
+
+    for (int i = 0; i < num_tests; i++) {
+        size_t key_len  = strlen(tests[i].key_hex) / 2;
+        size_t data_len = strlen(tests[i].data_hex) / 2;
+
+        if (hex_to_bytes(tests[i].key_hex,  key,  key_len)  < 0 ||
+            hex_to_bytes(tests[i].data_hex, data, data_len) < 0)
+        {
+            FAIL("hex parse");
+            return;
+        }
+
+        /* ---- OpenSSL reference ---- */
+        unsigned int out_len;
+        if (!HMAC(EVP_sha256(), key, (int)key_len,
+                  data, data_len, expected, &out_len) ||
+            out_len != HMAC_ISAL_DIGEST_SIZE)
+        {
+            FAIL("OpenSSL HMAC failed");
+            return;
+        }
+
+        /* ---- hmac_isal_single (no cache) ---- */
+        hmac_isal_single(key, key_len, data, data_len, computed, NULL);
+        if (memcmp(expected, computed, HMAC_ISAL_DIGEST_SIZE) != 0) {
+            FAIL("openssl cross-check (single, no cache)");
+            hex_dump("openssl",  expected, HMAC_ISAL_DIGEST_SIZE);
+            hex_dump("isal",     computed, HMAC_ISAL_DIGEST_SIZE);
+            return;
+        }
+
+        /* ---- hmac_isal_single (with cache) ---- */
+        hmac_isal_key_cache_t *cache =
+            hmac_isal_key_cache_create(key, key_len);
+        if (!cache) { FAIL("cache alloc"); return; }
+        hmac_isal_single(key, key_len, data, data_len, computed, cache);
+        hmac_isal_key_cache_destroy(cache);
+
+        if (memcmp(expected, computed, HMAC_ISAL_DIGEST_SIZE) != 0) {
+            FAIL("openssl cross-check (single, cached)");
+            hex_dump("openssl",  expected, HMAC_ISAL_DIGEST_SIZE);
+            hex_dump("isal",     computed, HMAC_ISAL_DIGEST_SIZE);
+            return;
+        }
+
+        /* ---- verify_single against OpenSSL reference ---- */
+        int bad = hmac_isal_verify_single(key, key_len, data, data_len,
+                                           expected, NULL);
+        if (bad != 0) {
+            FAIL("verify_single rejected OpenSSL MAC");
+            return;
+        }
+    }
+    PASS();
+}
+
+/*
+ * Multi-packet HMAC cross-check against OpenSSL.
+ *
+ * Uses the first num_test RFC 4231 test vectors as distinct packets,
+ * computes a reference MAC for each via OpenSSL, then requests the
+ * library to compute all of them in a single hmac_isal_multi call.
+ * Each output is compared individually against the OpenSSL reference.
+ */
+static void run_openssl_multi_cross_check(void)
+{
+    uint8_t  key_buf[6][256], msg_buf[6][512];
+    uint8_t  expected[6][HMAC_ISAL_DIGEST_SIZE];
+    uint8_t  mac_results[6][HMAC_ISAL_DIGEST_SIZE];
+    const uint8_t *msgs[6];
+    size_t         key_lens[6], msg_lens[6];
+    uint8_t       *mac_ptrs[6];
+
+    int n = num_tests > 6 ? 6 : num_tests;
+
+    /* Prepare per-packet key, message, and OpenSSL reference. */
+    for (int i = 0; i < n; i++) {
+        key_lens[i] = strlen(tests[i].key_hex) / 2;
+        msg_lens[i] = strlen(tests[i].data_hex) / 2;
+        if (hex_to_bytes(tests[i].key_hex,  key_buf[i], key_lens[i]) < 0 ||
+            hex_to_bytes(tests[i].data_hex, msg_buf[i], msg_lens[i]) < 0)
+        {
+            FAIL("hex parse");
+            return;
+        }
+
+        unsigned int out_len;
+        if (!HMAC(EVP_sha256(), key_buf[i], (int)key_lens[i],
+                  msg_buf[i], msg_lens[i], expected[i], &out_len) ||
+            out_len != HMAC_ISAL_DIGEST_SIZE)
+        {
+            FAIL("OpenSSL HMAC failed");
+            return;
+        }
+
+        msgs[i]    = msg_buf[i];
+        mac_ptrs[i] = mac_results[i];
+    }
+
+    /* ---- multi with distinct keys (per-packet key expansion) ---- */
+    /* hmac_isal_multi currently uses a single key for all packets.
+     * Compute one packet at a time to cross-check.
+     * (Multi-key multi-packet HMAC is not in scope for this library.) */
+    for (int i = 0; i < n; i++) {
+        hmac_isal_single(key_buf[i], key_lens[i],
+                         msgs[i], msg_lens[i], mac_results[i], NULL);
+        if (memcmp(expected[i], mac_results[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
+            FAIL("openssl multi cross-check");
+            hex_dump("openssl",  expected[i], HMAC_ISAL_DIGEST_SIZE);
+            hex_dump("isal",     mac_results[i], HMAC_ISAL_DIGEST_SIZE);
+            return;
+        }
+    }
+
+    /* ---- multi with same key, different messages ---- */
+    /* Use the first test case's key for all packets. */
+    {
+        const uint8_t *same_key_msgs[6];
+        size_t         same_key_lens[6];
+        uint8_t        same_key_macs[6][HMAC_ISAL_DIGEST_SIZE];
+        uint8_t       *same_key_ptrs[6];
+        uint8_t        same_key[256];
+        size_t         same_key_len = key_lens[0];
+
+        memcpy(same_key, key_buf[0], same_key_len);
+        for (int i = 0; i < n; i++) {
+            same_key_msgs[i] = msg_buf[i];
+            same_key_lens[i] = msg_lens[i];
+            same_key_ptrs[i] = same_key_macs[i];
+        }
+
+        /* Reference: OpenSSL for each separately. */
+        uint8_t same_key_expected[6][HMAC_ISAL_DIGEST_SIZE];
+        for (int i = 0; i < n; i++) {
+            unsigned int out_len;
+            HMAC(EVP_sha256(), same_key, (int)same_key_len,
+                 same_key_msgs[i], same_key_lens[i],
+                 same_key_expected[i], &out_len);
+        }
+
+        /* hmac_isal_multi: all packets in one call. */
+        int done = hmac_isal_multi(same_key, same_key_len,
+                                   same_key_msgs, same_key_lens,
+                                   same_key_ptrs, n, NULL);
+        if (done != n) { FAIL("multi wrong count"); return; }
+
+        for (int i = 0; i < n; i++) {
+            if (memcmp(same_key_expected[i], same_key_macs[i],
+                       HMAC_ISAL_DIGEST_SIZE) != 0)
+            {
+                FAIL("openssl multi same-key cross-check");
+                hex_dump("openssl", same_key_expected[i],
+                         HMAC_ISAL_DIGEST_SIZE);
+                hex_dump("isal",    same_key_macs[i],
+                         HMAC_ISAL_DIGEST_SIZE);
+                return;
+            }
+        }
+
+        /* ---- verify_multi against OpenSSL references ---- */
+        int bad = hmac_isal_verify_multi(same_key, same_key_len,
+                                          same_key_msgs, same_key_lens,
+                                          (const uint8_t **)same_key_ptrs,
+                                          n, NULL);
+        if (bad != 0) {
+            FAIL("verify_multi rejected valid MACs");
+            return;
+        }
+
+        /* ---- verify_multi with one forged MAC ---- */
+        same_key_macs[1][0] ^= 0xFF;
+        bad = hmac_isal_verify_multi(same_key, same_key_len,
+                                      same_key_msgs, same_key_lens,
+                                      (const uint8_t **)same_key_ptrs,
+                                      n, NULL);
+        same_key_macs[1][0] ^= 0xFF;  /* restore */
+        if (bad == 0) {
+            FAIL("verify_multi accepted forged MAC");
+            return;
+        }
+    }
+
+    PASS();
+}
+
+#endif /* HMAC_ISAL_HAVE_OPENSSL */
+
+/* ---------- main ---------- */
+
 int main(void)
 {
     printf("=== hmac_isal test suite ===\n\n");
@@ -344,6 +546,16 @@ skip_cache_test:;
 
     TEST("17 packets, cached");
     run_large_batch_cached_test();
+
+#ifdef HMAC_ISAL_HAVE_OPENSSL
+    /* ---- OpenSSL cross-validation ---- */
+    printf("\n[OpenSSL cross-validation]\n");
+    TEST("RFC 4231 vectors vs OpenSSL");
+    run_openssl_single_cross_check();
+
+    TEST("Multi-packet vs OpenSSL");
+    run_openssl_multi_cross_check();
+#endif
 
     /* ---- summary ---- */
     printf("\n");

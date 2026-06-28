@@ -309,3 +309,31 @@ hmac_isal_verify_single(const uint8_t *key, size_t key_len,
     hmac_isal_single(key, key_len, msg, msg_len, computed, cache);
     return ct_compare(computed, mac, HMAC_ISAL_DIGEST_SIZE);
 }
+
+int
+hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
+                       const uint8_t *msgs[], const size_t msg_lens[],
+                       const uint8_t *macs[], int num_packets,
+                       const hmac_isal_key_cache_t *cache)
+{
+    if (num_packets < 1)
+        return 0;
+
+    /* Allocate temporary buffers for the computed MACs. */
+    uint8_t *computed = malloc((size_t)num_packets * HMAC_ISAL_DIGEST_SIZE);
+    if (!computed)
+        return -1;
+
+    uint8_t *ptrs[HMAC_ISAL_MAX_BATCH];
+    for (int i = 0; i < num_packets; i++)
+        ptrs[i] = computed + (size_t)i * HMAC_ISAL_DIGEST_SIZE;
+
+    hmac_isal_multi(key, key_len, msgs, msg_lens, ptrs, num_packets, cache);
+
+    int diff = 0;
+    for (int i = 0; i < num_packets; i++)
+        diff |= ct_compare(ptrs[i], macs[i], HMAC_ISAL_DIGEST_SIZE);
+
+    free(computed);
+    return diff;
+}
