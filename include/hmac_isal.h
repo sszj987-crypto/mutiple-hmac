@@ -87,16 +87,30 @@ int hmac_isal_verify_single(const uint8_t *key, size_t key_len,
                             const hmac_isal_key_cache_t *cache);
 
 /*
- * Constant-time multi-packet HMAC verification.
+ * Constant-time multi-packet HMAC verification (bitmask result).
  *
- * Returns 0 if every macs[i] matches HMAC(key, msgs[i]), nonzero if any
- * differs.  num_packets may be any positive integer; batches larger than
- * 16 are split automatically under the hood.
+ * Returns a bitmask where bit i (LSB = packet 0) is set when
+ * macs[i] does NOT match HMAC(key, msgs[i]).  A return value of 0
+ * means all packets verified successfully.
+ *
+ * The caller can inspect individual bits to decide how to handle
+ * each packet, e.g.:
+ *
+ *   uint64_t bad = hmac_isal_verify_multi(key, klen, msgs, lens, macs, n, NULL);
+ *   if (bad) {
+ *       for (int i = 0; i < n; i++)
+ *           if (bad & ((uint64_t)1 << i))
+ *               handle_bad_packet(i);
+ *   }
+ *
+ * num_packets may be any positive integer; batches larger than 16
+ * are split automatically under the hood.  Only the bits corresponding
+ * to actual packets are significant.
  */
-int hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
-                           const uint8_t *msgs[], const size_t msg_lens[],
-                           const uint8_t *macs[], int num_packets,
-                           const hmac_isal_key_cache_t *cache);
+uint64_t hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
+                                const uint8_t *msgs[], const size_t msg_lens[],
+                                const uint8_t *macs[], int num_packets,
+                                const hmac_isal_key_cache_t *cache);
 
 #ifdef __cplusplus
 }

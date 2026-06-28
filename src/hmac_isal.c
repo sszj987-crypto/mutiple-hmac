@@ -310,7 +310,7 @@ hmac_isal_verify_single(const uint8_t *key, size_t key_len,
     return ct_compare(computed, mac, HMAC_ISAL_DIGEST_SIZE);
 }
 
-int
+uint64_t
 hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
                        const uint8_t *msgs[], const size_t msg_lens[],
                        const uint8_t *macs[], int num_packets,
@@ -322,18 +322,22 @@ hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
     /* Allocate temporary buffers for the computed MACs. */
     uint8_t *computed = malloc((size_t)num_packets * HMAC_ISAL_DIGEST_SIZE);
     if (!computed)
-        return -1;
+        return UINT64_MAX;  /* allocation failure → every bit set */
 
-    uint8_t *ptrs[HMAC_ISAL_MAX_BATCH];
+    /* VLA sized to the actual packet count so hmac_isal_multi can
+     * write back results in any internal batch size without overrun. */
+    uint8_t *ptrs[num_packets];
     for (int i = 0; i < num_packets; i++)
         ptrs[i] = computed + (size_t)i * HMAC_ISAL_DIGEST_SIZE;
 
     hmac_isal_multi(key, key_len, msgs, msg_lens, ptrs, num_packets, cache);
 
-    int diff = 0;
-    for (int i = 0; i < num_packets; i++)
-        diff |= ct_compare(ptrs[i], macs[i], HMAC_ISAL_DIGEST_SIZE);
+    uint64_t mask = 0;
+    for (int i = 0; i < num_packets; i++) {
+        if (ct_compare(ptrs[i], macs[i], HMAC_ISAL_DIGEST_SIZE))
+            mask |= (uint64_t)1 << i;
+    }
 
     free(computed);
-    return diff;
+    return mask;
 }

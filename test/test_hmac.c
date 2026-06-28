@@ -270,7 +270,11 @@ static void run_large_batch_cached_test(void)
 
 #ifdef HMAC_ISAL_HAVE_OPENSSL
 
+/* HMAC() is deprecated in OpenSSL 3.x but remains the simplest way to
+ * obtain a reference value for cross-validation; suppress the warning. */
+#define OPENSSL_SUPPRESS_DEPRECATED
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 /*
  * Cross-check every RFC 4231 test vector against OpenSSL.
@@ -441,24 +445,34 @@ static void run_openssl_multi_cross_check(void)
         }
 
         /* ---- verify_multi against OpenSSL references ---- */
-        int bad = hmac_isal_verify_multi(same_key, same_key_len,
-                                          same_key_msgs, same_key_lens,
-                                          (const uint8_t **)same_key_ptrs,
-                                          n, NULL);
-        if (bad != 0) {
+        uint64_t bad_mask = hmac_isal_verify_multi(same_key, same_key_len,
+                                                    same_key_msgs,
+                                                    same_key_lens,
+                                                    (const uint8_t **)
+                                                        same_key_ptrs,
+                                                    n, NULL);
+        if (bad_mask != 0) {
             FAIL("verify_multi rejected valid MACs");
             return;
         }
 
         /* ---- verify_multi with one forged MAC ---- */
         same_key_macs[1][0] ^= 0xFF;
-        bad = hmac_isal_verify_multi(same_key, same_key_len,
-                                      same_key_msgs, same_key_lens,
-                                      (const uint8_t **)same_key_ptrs,
-                                      n, NULL);
+        bad_mask = hmac_isal_verify_multi(same_key, same_key_len,
+                                           same_key_msgs, same_key_lens,
+                                           (const uint8_t **)same_key_ptrs,
+                                           n, NULL);
         same_key_macs[1][0] ^= 0xFF;  /* restore */
-        if (bad == 0) {
+        if (bad_mask == 0) {
             FAIL("verify_multi accepted forged MAC");
+            return;
+        }
+        if ((bad_mask & ((uint64_t)1 << 1)) == 0) {
+            FAIL("verify_multi forged MAC: bit 1 not set");
+            return;
+        }
+        if (bad_mask & ~((uint64_t)1 << 1)) {
+            FAIL("verify_multi forged MAC: extra bits set");
             return;
         }
     }
