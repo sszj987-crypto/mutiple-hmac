@@ -60,7 +60,8 @@ void hmac_isal_single(const uint8_t *key, size_t key_len,
  * parallel via SIMD.  Each macs[i] must point to a
  * HMAC_ISAL_DIGEST_SIZE-byte buffer.
  *
- * num_packets must be in [1, HMAC_ISAL_MAX_BATCH].
+ * num_packets may be any positive integer; batches larger than 8 are
+ * split automatically under the hood.
  *
  * Returns the number of packets processed (num_packets on success).
  *

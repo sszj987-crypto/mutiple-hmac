@@ -53,7 +53,7 @@ Compute `HMAC(key, msg)`.  If `cache` is non-NULL, the cached ipad/opad
 states are reused, saving two SHA256 block compressions.  The caller is
 responsible for ensuring the cache matches the key.
 
-### Multi-packet HMAC (up to 8 packets in parallel)
+### Multi-packet HMAC
 
 ```c
 int hmac_isal_multi(const uint8_t *key, size_t key_len,
@@ -62,9 +62,10 @@ int hmac_isal_multi(const uint8_t *key, size_t key_len,
                     const hmac_isal_key_cache_t *cache);
 ```
 
-Compute HMAC for `num_packets` messages (1–8) in a single call.  The inner
+Compute HMAC for `num_packets` messages in a single call.  The inner
 hashes are computed in parallel using the multi-buffer SHA256 engine; the
-outer hashes are computed in parallel in a second pass.
+outer hashes are computed in parallel in a second pass.  Large batches
+are internally split into groups of 8.
 
 If `cache` is provided, the pre-computed ipad/opad bytes are used instead
 of expanding the key on every call.

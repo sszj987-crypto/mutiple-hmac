@@ -136,7 +136,7 @@ hmac_isal_single(const uint8_t *key, size_t key_len,
     }
 }
 
-/* ---------- multi-packet HMAC (up to 8 packets in parallel) ---------- */
+/* ---------- multi-packet HMAC (any number, batched internally in groups of 8) ---------- */
 
 /*
  * Submit num_packets jobs to a multi-buffer SHA256 context.
@@ -166,7 +166,7 @@ hmac_isal_multi(const uint8_t *key, size_t key_len,
                 uint8_t *macs[], int num_packets,
                 const hmac_isal_key_cache_t *cache)
 {
-    if (num_packets < 1 || num_packets > HMAC_ISAL_MAX_BATCH)
+    if (num_packets < 1)
         return 0;
 
     uint8_t ipad[HMAC_ISAL_BLOCK_SIZE];
@@ -184,31 +184,50 @@ hmac_isal_multi(const uint8_t *key, size_t key_len,
         opad_ptr = opad;
     }
 
-    /* ---- phase 1: compute inner hashes in parallel ---- */
-    uint8_t inner[HMAC_ISAL_MAX_BATCH][HMAC_ISAL_DIGEST_SIZE];
+    int processed = 0;
+    while (processed < num_packets) {
+        int batch = num_packets - processed;
+        if (batch > HMAC_ISAL_MAX_BATCH)
+            batch = HMAC_ISAL_MAX_BATCH;
 
-    {
-        SHA256_MB_CTX mb;
-        sha256_mb_init(&mb);
-        mb_submit(&mb, ipad_ptr, msgs, msg_lens, num_packets);
-        for (int i = 0; i < num_packets; i++)
-            sha256_mb_final(inner[i], &mb, i);
-    }
+        const uint8_t *batch_msgs[HMAC_ISAL_MAX_BATCH];
+        size_t        batch_lens[HMAC_ISAL_MAX_BATCH];
+        uint8_t      *batch_macs[HMAC_ISAL_MAX_BATCH];
 
-    /* ---- phase 2: compute outer hashes in parallel ---- */
-    {
-        SHA256_MB_CTX mb;
-        const uint8_t *inner_ptrs[HMAC_ISAL_MAX_BATCH];
-        size_t        inner_lens[HMAC_ISAL_MAX_BATCH];
-
-        sha256_mb_init(&mb);
-        for (int i = 0; i < num_packets; i++) {
-            inner_ptrs[i] = inner[i];
-            inner_lens[i] = HMAC_ISAL_DIGEST_SIZE;
+        for (int i = 0; i < batch; i++) {
+            batch_msgs[i] = msgs[processed + i];
+            batch_lens[i] = msg_lens[processed + i];
+            batch_macs[i] = macs[processed + i];
         }
-        mb_submit(&mb, opad_ptr, inner_ptrs, inner_lens, num_packets);
-        for (int i = 0; i < num_packets; i++)
-            sha256_mb_final(macs[i], &mb, i);
+
+        /* ---- phase 1: compute inner hashes in parallel ---- */
+        uint8_t inner[HMAC_ISAL_MAX_BATCH][HMAC_ISAL_DIGEST_SIZE];
+
+        {
+            SHA256_MB_CTX mb;
+            sha256_mb_init(&mb);
+            mb_submit(&mb, ipad_ptr, batch_msgs, batch_lens, batch);
+            for (int i = 0; i < batch; i++)
+                sha256_mb_final(inner[i], &mb, i);
+        }
+
+        /* ---- phase 2: compute outer hashes in parallel ---- */
+        {
+            SHA256_MB_CTX mb;
+            const uint8_t *inner_ptrs[HMAC_ISAL_MAX_BATCH];
+            size_t        inner_lens[HMAC_ISAL_MAX_BATCH];
+
+            sha256_mb_init(&mb);
+            for (int i = 0; i < batch; i++) {
+                inner_ptrs[i] = inner[i];
+                inner_lens[i] = HMAC_ISAL_DIGEST_SIZE;
+            }
+            mb_submit(&mb, opad_ptr, inner_ptrs, inner_lens, batch);
+            for (int i = 0; i < batch; i++)
+                sha256_mb_final(batch_macs[i], &mb, i);
+        }
+
+        processed += batch;
     }
 
     return num_packets;
