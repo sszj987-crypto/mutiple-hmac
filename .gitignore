@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+*.o
+
+# Test binary
+test/test_hmac
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Library archive
+*.a
+*.so
+*.dylib
+
+# Compiler outputs
+*.d
+*.gcno
+*.gcda
+*.gcov
+*.profraw
+*.profdata
+
+# Generated
+*.o.d
+*.dSYM/
