@@ -180,140 +180,90 @@ static void run_test(const hmac_test *t, int use_cache)
     PASS();
 }
 
-/* ---------- run multi-packet test ---------- */
+/* ---------- multi-packet consistency harness ---------- */
 
-static void run_multi_test(void)
+/*
+ * Run n packets sharing the same key.  Expected MACs come from the
+ * single-packet path (validated against RFC 4231 separately), so this
+ * checks that multi-buffer output matches single-packet output exactly.
+ */
+static void run_multi_consistency_test(int count, int use_cache)
 {
-    /* Use the first 3 test vectors as a batch */
-    uint8_t key[256];
-    uint8_t data[3][512];
-    uint8_t expected[3][HMAC_ISAL_DIGEST_SIZE];
-    uint8_t *macs[3];
-    uint8_t  mac_buf[3][HMAC_ISAL_DIGEST_SIZE];
-    const uint8_t *msgs[3];
-    size_t    lens[3];
+    uint8_t  key_buf[64];
+    size_t   key_len;
+    uint8_t  msg[64];
+    size_t   msg_len;
+    uint8_t  expected[HMAC_ISAL_DIGEST_SIZE];
+    uint8_t *mac_ptrs[HMAC_ISAL_MAX_BATCH + 1];
+    uint8_t  mac_results[HMAC_ISAL_MAX_BATCH + 1][HMAC_ISAL_DIGEST_SIZE];
+    const uint8_t *msg_ptrs[HMAC_ISAL_MAX_BATCH + 1];
+    size_t         msg_lens[HMAC_ISAL_MAX_BATCH + 1];
 
-    for (int i = 0; i < 3; i++) {
-        size_t kl = strlen(tests[i].key_hex) / 2;
-        size_t dl = strlen(tests[i].data_hex) / 2;
-        if (hex_to_bytes(tests[i].key_hex,  key,          kl) < 0 ||
-            hex_to_bytes(tests[i].data_hex, data[i],      dl) < 0 ||
-            hex_to_bytes(tests[i].mac_hex,  expected[i],  HMAC_ISAL_DIGEST_SIZE) < 0) {
-            FAIL("multi hex parse");
-            return;
-        }
-        msgs[i] = data[i];
-        lens[i] = dl;
-        macs[i] = mac_buf[i];
+    /* Use TC2 (first test case) key + message throughout */
+    key_len = strlen(tests[0].key_hex) / 2;
+    msg_len = strlen(tests[0].data_hex) / 2;
+    if (hex_to_bytes(tests[0].key_hex,  key_buf, key_len) < 0 ||
+        hex_to_bytes(tests[0].data_hex, msg,     msg_len) < 0) {
+        FAIL("hex parse");
+        return;
     }
 
-    int n = hmac_isal_multi(key, 20, msgs, lens, macs, 3, NULL);
-    if (n != 3) { FAIL("multi returned wrong count"); return; }
+    /* Reference MAC from the (already-validated) single packet path */
+    hmac_isal_single(key_buf, key_len, msg, msg_len, expected, NULL);
 
-    for (int i = 0; i < 3; i++) {
-        if (memcmp(expected[i], mac_buf[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
-            FAIL("multi MAC mismatch");
-            hex_dump("expected", expected[i], HMAC_ISAL_DIGEST_SIZE);
-            hex_dump("got",      mac_buf[i], HMAC_ISAL_DIGEST_SIZE);
-            return;
+    int n = count > HMAC_ISAL_MAX_BATCH + 1 ? HMAC_ISAL_MAX_BATCH + 1 : count;
+
+    hmac_isal_key_cache_t *cache = NULL;
+    if (use_cache) {
+        cache = hmac_isal_key_cache_create(key_buf, key_len);
+        if (!cache) { FAIL("cache alloc"); return; }
+    }
+
+    for (int i = 0; i < n; i++) {
+        msg_ptrs[i] = msg;
+        msg_lens[i] = msg_len;
+        mac_ptrs[i] = mac_results[i];
+    }
+
+    int done = hmac_isal_multi(key_buf, key_len, msg_ptrs, msg_lens,
+                               mac_ptrs, n, cache);
+    if (done != n) {
+        FAIL("wrong count");
+        goto cleanup;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (memcmp(expected, mac_results[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
+            FAIL("MAC mismatch");
+            hex_dump("expected", expected, HMAC_ISAL_DIGEST_SIZE);
+            hex_dump("got",      mac_results[i], HMAC_ISAL_DIGEST_SIZE);
+            goto cleanup;
         }
     }
 
-    /* Repeat with key cache */
-    hmac_isal_key_cache_t *cache =
-        hmac_isal_key_cache_create(key, 20);
-    if (!cache) { FAIL("multi cache alloc"); return; }
+cleanup:
+    if (cache)
+        hmac_isal_key_cache_destroy(cache);
 
-    n = hmac_isal_multi(key, 20, msgs, lens, macs, 3, cache);
-    if (n != 3) { FAIL("multi cached returned wrong count"); return; }
+    if (failures > 0)
+        return;  /* let caller's FAIL() already incremented */
 
-    for (int i = 0; i < 3; i++) {
-        if (memcmp(expected[i], mac_buf[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
-            FAIL("multi cached MAC mismatch");
-            hex_dump("expected", expected[i], HMAC_ISAL_DIGEST_SIZE);
-            hex_dump("got",      mac_buf[i], HMAC_ISAL_DIGEST_SIZE);
-            hmac_isal_key_cache_destroy(cache);
-            return;
-        }
-    }
-
-    hmac_isal_key_cache_destroy(cache);
     PASS();
 }
 
 
-/* ---------- run large-batch (>8 packets) test ---------- */
-/* Verifies that hmac_isal_multi correctly batches internally. */
-
 static void run_large_batch_test(void)
 {
-    /* All 6 RFC 4231 test cases + 5 duplicates of TC2 = 11 packets.
-     * This exercises the batching path (1st batch of 8, 2nd batch of 3). */
-    int total = num_tests + 5;  /* 11 */
-    uint8_t key[256];
-    uint8_t data[11][512];
-    uint8_t expected[11][HMAC_ISAL_DIGEST_SIZE];
-    uint8_t *macs[11], mac_buf[11][HMAC_ISAL_DIGEST_SIZE];
-    const uint8_t *msgs[11];
-    size_t lens[11];
+    /* Packets use the same key + message (TC2).
+     * HMAC_ISAL_MAX_BATCH=16, so HMAC_ISAL_MAX_BATCH+1=17 triggers batching. */
+    int total = HMAC_ISAL_MAX_BATCH + 1;  /* 17 */
+    run_multi_consistency_test(total, 0);
+}
 
-    for (int i = 0; i < num_tests; i++) {
-        size_t kl = strlen(tests[i].key_hex) / 2;
-        size_t dl = strlen(tests[i].data_hex) / 2;
-        if (hex_to_bytes(tests[i].key_hex, key, 20) < 0 ||
-            hex_to_bytes(tests[i].data_hex, data[i], dl) < 0 ||
-            hex_to_bytes(tests[i].mac_hex, expected[i], HMAC_ISAL_DIGEST_SIZE) < 0) {
-            FAIL("large hex parse");
-            return;
-        }
-        msgs[i] = data[i];
-        lens[i] = dl;
-        macs[i] = mac_buf[i];
-    }
-    /* Pad with copies of TC2 */
-    for (int i = num_tests; i < total; i++) {
-        size_t kl = strlen(tests[0].key_hex) / 2;
-        size_t dl = strlen(tests[0].data_hex) / 2;
-        hex_to_bytes(tests[0].key_hex, key, kl);
-        hex_to_bytes(tests[0].data_hex, data[i], dl);
-        hex_to_bytes(tests[0].mac_hex, expected[i], HMAC_ISAL_DIGEST_SIZE);
-        msgs[i] = data[i];
-        lens[i] = dl;
-        macs[i] = mac_buf[i];
-    }
-
-    /* All share the same 20-byte key */
-    int n = hmac_isal_multi(key, 20, msgs, lens, macs, total, NULL);
-    if (n != total) { FAIL("large batch: wrong count"); return; }
-
-    for (int i = 0; i < total; i++) {
-        if (memcmp(expected[i], mac_buf[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
-            FAIL("large batch: MAC mismatch");
-            hex_dump("expected", expected[i], HMAC_ISAL_DIGEST_SIZE);
-            hex_dump("got",      mac_buf[i], HMAC_ISAL_DIGEST_SIZE);
-            return;
-        }
-    }
-
-    /* repeat with key cache */
-    hmac_isal_key_cache_t *cache = hmac_isal_key_cache_create(key, 20);
-    if (!cache) { FAIL("large batch: cache alloc"); return; }
-
-    n = hmac_isal_multi(key, 20, msgs, lens, macs, total, cache);
-    if (n != total) { FAIL("large batch cached: wrong count"); return; }
-
-    for (int i = 0; i < total; i++) {
-        if (memcmp(expected[i], mac_buf[i], HMAC_ISAL_DIGEST_SIZE) != 0) {
-            FAIL("large batch cached: MAC mismatch");
-            hex_dump("expected", expected[i], HMAC_ISAL_DIGEST_SIZE);
-            hex_dump("got",      mac_buf[i], HMAC_ISAL_DIGEST_SIZE);
-            hmac_isal_key_cache_destroy(cache);
-            return;
-        }
-    }
-
-    hmac_isal_key_cache_destroy(cache);
-    PASS();
+static void run_large_batch_cached_test(void)
+{
+    int total = HMAC_ISAL_MAX_BATCH + 1;  /* 17 */
+    run_multi_consistency_test(total, 1);
 }
 
 /* ---------- main ---------- */
@@ -342,21 +292,58 @@ int main(void)
 
     /* ---- multi-packet tests ---- */
     printf("\n[Multi-packet (3 in parallel)]\n");
-    TEST("first 3 vectors, no cache");
-    run_multi_test();
+    TEST("3 identical packets, no cache");
+    run_multi_consistency_test(3, 0);
 
-    TEST("first 3 vectors, cached");
-    run_multi_test();
+    TEST("3 identical packets, cached");
+    run_multi_consistency_test(3, 1);
 
-    /* ---- large-batch tests (>8 packets, triggers internal batching) ---- */
-    printf("
-[Large batch (11 packets, 2 internal batches)]
-");
-    TEST("11 packets, no cache");
+    /* ---- key-cache multi test ---- */
+    printf("\n[Multi-packet, key cache]\n");
+    {
+        uint8_t  key_buf[64], msg[64], expected[32];
+        uint8_t *mac_ptrs[4], mac_results[4][32];
+        const uint8_t *msg_ptrs[4];
+        size_t msg_lens[4], key_len, msg_len;
+
+        key_len = strlen(tests[0].key_hex) / 2;
+        msg_len = strlen(tests[0].data_hex) / 2;
+        hex_to_bytes(tests[0].key_hex,  key_buf, key_len);
+        hex_to_bytes(tests[0].data_hex, msg,     msg_len);
+        hmac_isal_single(key_buf, key_len, msg, msg_len, expected, NULL);
+
+        hmac_isal_key_cache_t *cache = hmac_isal_key_cache_create(key_buf, key_len);
+        if (!cache) { FAIL("cache alloc"); goto skip_cache_test; }
+
+        for (int i = 0; i < 4; i++) {
+            msg_ptrs[i] = msg; msg_lens[i] = msg_len; mac_ptrs[i] = mac_results[i];
+        }
+
+        int n = hmac_isal_multi(key_buf, key_len, msg_ptrs, msg_lens,
+                                mac_ptrs, 4, cache);
+        if (n != 4) { FAIL("cache wrong count"); }
+        else {
+            for (int i = 0; i < 4; i++) {
+                if (memcmp(expected, mac_results[i], 32) != 0) {
+                    FAIL("cache MAC mismatch");
+                    goto cache_done;
+                }
+            }
+            PASS();
+        }
+cache_done:
+        hmac_isal_key_cache_destroy(cache);
+    }
+skip_cache_test:;
+
+    /* ---- large-batch tests (>HMAC_ISAL_MAX_BATCH packets) ---- */
+    printf("\n[Large batch (%d packets, >1 internal batch)]\n",
+           HMAC_ISAL_MAX_BATCH + 1);
+    TEST("17 packets, no cache");
     run_large_batch_test();
 
-    TEST("11 packets, cached");
-    run_large_batch_test();
+    TEST("17 packets, cached");
+    run_large_batch_cached_test();
 
     /* ---- summary ---- */
     printf("\n");

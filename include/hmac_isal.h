@@ -8,18 +8,22 @@
 extern "C" {
 #endif
 
-/* HMAC-SHA256 constants */
+/* HMAC-SHA256 constants
+ *
+ * HMAC_ISAL_MAX_BATCH is set to 16 to match ISAL_SHA256_MAX_LANES,
+ * supporting up to 16-wide SIMD on AVX-512 machines.
+ * The ISA-L manager adapts automatically to the available ISA
+ * (4 lanes on SSE4, 8 on AVX2, 16 on AVX-512).
+ */
 #define HMAC_ISAL_BLOCK_SIZE   64
 #define HMAC_ISAL_DIGEST_SIZE  32
-#define HMAC_ISAL_MAX_BATCH    8
+#define HMAC_ISAL_MAX_BATCH    16
 
 /*
- * Opaque key cache that stores the intermediate SHA256 states
- * after processing the ipad and opad blocks.
+ * Opaque key cache that stores the pre-computed ipad and opad bytes.
  *
  * When the same key is used for multiple HMAC computations,
- * this avoids recomputing the two SHA256 block compressions
- * for the key expansion each time.
+ * this avoids re-expanding the key on every call.
  */
 typedef struct hmac_isal_key_cache hmac_isal_key_cache_t;
 
@@ -27,8 +31,8 @@ typedef struct hmac_isal_key_cache hmac_isal_key_cache_t;
  * Create a key cache from a key.
  *
  * If key_len > HMAC_ISAL_BLOCK_SIZE, the key is hashed down first
- * (per RFC 2104). The cache stores the SHA256 contexts after
- * processing (K' XOR ipad) and (K' XOR opad).
+ * (per RFC 2104). The cache stores the resulting (K' XOR ipad) and
+ * (K' XOR opad) byte arrays.
  *
  * Returns NULL on allocation failure.
  */
@@ -43,9 +47,8 @@ void hmac_isal_key_cache_destroy(hmac_isal_key_cache_t *cache);
  *
  * Computes HMAC(key, msg) and writes the 32-byte result into mac.
  *
- * If cache is non-NULL and corresponds to the same key, the cached
- * ipad/opad intermediate states are reused to save two SHA256 block
- * compressions.  The caller is responsible for ensuring cache matches key.
+ * If cache is non-NULL, the pre-computed ipad/opad bytes are reused
+ * to avoid re-expanding the key on every call.
  */
 void hmac_isal_single(const uint8_t *key, size_t key_len,
                       const uint8_t *msg, size_t msg_len,
@@ -60,7 +63,7 @@ void hmac_isal_single(const uint8_t *key, size_t key_len,
  * parallel via SIMD.  Each macs[i] must point to a
  * HMAC_ISAL_DIGEST_SIZE-byte buffer.
  *
- * num_packets may be any positive integer; batches larger than 8 are
+ * num_packets may be any positive integer; batches larger than 16 are
  * split automatically under the hood.
  *
  * Returns the number of packets processed (num_packets on success).
@@ -77,7 +80,6 @@ int hmac_isal_multi(const uint8_t *key, size_t key_len,
  * Constant-time HMAC verification.
  *
  * Returns 0 if mac matches the computed HMAC(key, msg), nonzero otherwise.
- * If cache is non-NULL, key is obtained from cache and key_len is ignored.
  */
 int hmac_isal_verify_single(const uint8_t *key, size_t key_len,
                             const uint8_t *msg, size_t msg_len,

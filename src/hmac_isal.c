@@ -1,10 +1,28 @@
+/*
+ *  hmac_isal.c — SIMD-accelerated HMAC-SHA256 using Intel ISA-L crypto
+ *
+ *  Both single-packet and multi-packet HMAC are built on the ISA-L
+ *  multi-buffer SHA256 context-manager API (isal_sha256_ctx_mgr_*),
+ *  which auto-dispatches to SSE4 (4 lanes), AVX2 (8 lanes), or
+ *  AVX-512 (16 lanes) depending on the CPU.
+ *
+ *  Key caching stores the pre-computed ipad/opad byte arrays so the
+ *  key-expansion step (RFC 2104) is not repeated when the same key
+ *  is used across many messages.
+ *
+ *  SPDX-License-Identifier: MIT
+ */
+
 #include "hmac_isal.h"
 
 #include <string.h>
 #include <stdlib.h>
 
-#include <sha256_ni.h>
-#include <sha256_mb.h>
+#include <isa-l_crypto/sha256_mb.h>
+#include <isa-l_crypto/multi_buffer.h>
+
+/* Alignment required by ISAL_SHA256_HASH_CTX (16-byte minimum for SIMD). */
+#define ALIGNED16 __attribute__((aligned(16)))
 
 /* ---------- internal helpers ---------- */
 
@@ -15,17 +33,29 @@
  * If key_len > 64,  k' = SHA256(key) zero-padded to 64 bytes.
  *
  * The result is k' XOR pad (where pad is 0x36 for ipad, 0x5C for opad).
+ *
+ * The hash path for over-long keys uses the same multi-buffer manager
+ * so only one SHA256 implementation needs to be linked.
  */
 static void xor_key_pad(const uint8_t *key, size_t key_len,
-                        uint8_t out[64], uint8_t pad)
+                        uint8_t out[HMAC_ISAL_BLOCK_SIZE], uint8_t pad)
 {
-    uint8_t k_prime[64];
+    uint8_t k_prime[HMAC_ISAL_BLOCK_SIZE];
 
     if (key_len > HMAC_ISAL_BLOCK_SIZE) {
-        SHA256_CTX ctx;
-        sha256_ni_init(&ctx);
-        sha256_ni_update(&ctx, key, key_len);
-        sha256_ni_final(k_prime, &ctx);
+        /* RFC 2104: hash long keys down to HASH_SIZE bytes */
+        ISAL_SHA256_HASH_CTX_MGR mgr;
+        ISAL_SHA256_HASH_CTX     ctx ALIGNED16;
+        ISAL_SHA256_HASH_CTX    *done = NULL;
+
+        isal_sha256_ctx_mgr_init(&mgr);
+        isal_hash_ctx_init(&ctx);
+        isal_sha256_ctx_mgr_submit(&mgr, &ctx, &done,
+                                   key, (uint32_t)key_len, ISAL_HASH_ENTIRE);
+        while (!done)
+            isal_sha256_ctx_mgr_flush(&mgr, &done);
+
+        memcpy(k_prime, isal_hash_ctx_digest(&ctx), HMAC_ISAL_DIGEST_SIZE);
         memset(k_prime + HMAC_ISAL_DIGEST_SIZE, 0,
                HMAC_ISAL_BLOCK_SIZE - HMAC_ISAL_DIGEST_SIZE);
     } else {
@@ -37,28 +67,10 @@ static void xor_key_pad(const uint8_t *key, size_t key_len,
         out[i] = k_prime[i] ^ pad;
 }
 
-/*
- * Compute SHA256(data, len) and write 32-byte digest into out.
- */
-static void sha256_compute(const uint8_t *data, size_t len,
-                           uint8_t out[HMAC_ISAL_DIGEST_SIZE])
-{
-    SHA256_CTX ctx;
-    sha256_ni_init(&ctx);
-    sha256_ni_update(&ctx, data, len);
-    sha256_ni_final(out, &ctx);
-}
-
 /* ---------- key cache ---------- */
 
 struct hmac_isal_key_cache {
-    /* SHA256 context saved right after processing the full ipad block */
-    SHA256_CTX ipad_ctx;
-    /* SHA256 context saved right after processing the full opad block */
-    SHA256_CTX opad_ctx;
-    /* Pre-computed ipad bytes (used as fallback in multi-buffer path) */
     uint8_t ipad[HMAC_ISAL_BLOCK_SIZE];
-    /* Pre-computed opad bytes (used as fallback in multi-buffer path) */
     uint8_t opad[HMAC_ISAL_BLOCK_SIZE];
 };
 
@@ -72,15 +84,6 @@ hmac_isal_key_cache_create(const uint8_t *key, size_t key_len)
     xor_key_pad(key, key_len, cache->ipad, 0x36);
     xor_key_pad(key, key_len, cache->opad, 0x5C);
 
-    /* Save the SHA256 state right after processing the ipad block.
-     * Subsequent HMAC calls can clone this context, feed the message,
-     * and finalize — skipping the per-call ipad block compression. */
-    sha256_ni_init(&cache->ipad_ctx);
-    sha256_ni_update(&cache->ipad_ctx, cache->ipad, HMAC_ISAL_BLOCK_SIZE);
-
-    sha256_ni_init(&cache->opad_ctx);
-    sha256_ni_update(&cache->opad_ctx, cache->opad, HMAC_ISAL_BLOCK_SIZE);
-
     return cache;
 }
 
@@ -92,71 +95,128 @@ hmac_isal_key_cache_destroy(hmac_isal_key_cache_t *cache)
 
 /* ---------- single-packet HMAC ---------- */
 
+/*
+ * Compute a single SHA256 hash via the multi-buffer manager.
+ *
+ * The two-part message (first block, then remaining data) is submitted
+ * as ISAL_HASH_FIRST + ISAL_HASH_LAST.  After the LAST submission the
+ * job is flushed to completion.
+ */
+static void sha256_compute_two_part(const uint8_t *part1, size_t part1_len,
+                                    const uint8_t *part2, size_t part2_len,
+                                    uint8_t digest[HMAC_ISAL_DIGEST_SIZE])
+{
+    ISAL_SHA256_HASH_CTX_MGR mgr;
+    ISAL_SHA256_HASH_CTX     ctx ALIGNED16;
+    ISAL_SHA256_HASH_CTX    *done = NULL;
+
+    isal_sha256_ctx_mgr_init(&mgr);
+    isal_hash_ctx_init(&ctx);
+
+    isal_sha256_ctx_mgr_submit(&mgr, &ctx, &done,
+                               part1, (uint32_t)part1_len, ISAL_HASH_FIRST);
+    isal_sha256_ctx_mgr_submit(&mgr, &ctx, &done,
+                               part2, (uint32_t)part2_len, ISAL_HASH_LAST);
+
+    while (!done)
+        isal_sha256_ctx_mgr_flush(&mgr, &done);
+
+    memcpy(digest, isal_hash_ctx_digest(&ctx), HMAC_ISAL_DIGEST_SIZE);
+}
+
 void
 hmac_isal_single(const uint8_t *key, size_t key_len,
                  const uint8_t *msg, size_t msg_len,
                  uint8_t mac[HMAC_ISAL_DIGEST_SIZE],
                  const hmac_isal_key_cache_t *cache)
 {
-    uint8_t inner[HMAC_ISAL_DIGEST_SIZE];
+    uint8_t          ipad[HMAC_ISAL_BLOCK_SIZE];
+    uint8_t          opad[HMAC_ISAL_BLOCK_SIZE];
+    const uint8_t   *ipad_ptr;
+    const uint8_t   *opad_ptr;
+    uint8_t          inner[HMAC_ISAL_DIGEST_SIZE];
 
     if (cache) {
-        /* ----- fast path: reuse cached ipad/opad state ----- */
-        SHA256_CTX ctx;
-
-        /* inner = SHA256(ipad || msg) */
-        memcpy(&ctx, &cache->ipad_ctx, sizeof(ctx));
-        sha256_ni_update(&ctx, msg, msg_len);
-        sha256_ni_final(inner, &ctx);
-
-        /* mac = SHA256(opad || inner) */
-        memcpy(&ctx, &cache->opad_ctx, sizeof(ctx));
-        sha256_ni_update(&ctx, inner, sizeof(inner));
-        sha256_ni_final(mac, &ctx);
+        ipad_ptr = cache->ipad;
+        opad_ptr = cache->opad;
     } else {
-        /* ----- slow path: full key expansion every time ----- */
-        uint8_t ipad[HMAC_ISAL_BLOCK_SIZE];
-        uint8_t opad[HMAC_ISAL_BLOCK_SIZE];
-        SHA256_CTX ctx;
-
         xor_key_pad(key, key_len, ipad, 0x36);
         xor_key_pad(key, key_len, opad, 0x5C);
-
-        /* inner = SHA256(ipad || msg) */
-        sha256_ni_init(&ctx);
-        sha256_ni_update(&ctx, ipad, sizeof(ipad));
-        sha256_ni_update(&ctx, msg, msg_len);
-        sha256_ni_final(inner, &ctx);
-
-        /* mac = SHA256(opad || inner) */
-        sha256_ni_init(&ctx);
-        sha256_ni_update(&ctx, opad, sizeof(opad));
-        sha256_ni_update(&ctx, inner, sizeof(inner));
-        sha256_ni_final(mac, &ctx);
+        ipad_ptr = ipad;
+        opad_ptr = opad;
     }
+
+    /* inner = SHA256(ipad || msg) */
+    sha256_compute_two_part(ipad_ptr, HMAC_ISAL_BLOCK_SIZE,
+                            msg, msg_len, inner);
+
+    /* mac = SHA256(opad || inner) */
+    sha256_compute_two_part(opad_ptr, HMAC_ISAL_BLOCK_SIZE,
+                            inner, HMAC_ISAL_DIGEST_SIZE, mac);
 }
 
-/* ---------- multi-packet HMAC (any number, batched internally in groups of 8) ---------- */
+/* ---------- multi-packet HMAC ---------- */
 
 /*
- * Submit num_packets jobs to a multi-buffer SHA256 context.
+ * Process up to @n packets of a single HMAC phase (inner or outer)
+ * in parallel through the ISA-L multi-buffer manager, collecting
+ * the resulting digests into @digests.
  *
- * Two-phase submission:
- *   phase 0 – feed the first block (the padding block from HMAC key expansion)
- *   phase 1 – feed the remaining data    (message for inner, inner-hash for outer)
- *
- * This is a helper shared by the inner-hash and outer-hash phases of
- * multi-packet HMAC.
+ * Each context goes through FIRST (the 64-byte ipad/opad block)
+ * then LAST (the variable-length message or 32-byte inner hash).
+ * Because the manager may return completed jobs out of order,
+ * each context's user_data field holds the packet index.
  */
-static void mb_submit(SHA256_MB_CTX *mb,
-                      const uint8_t *first_block,
-                      const uint8_t *const *data, const size_t *lens,
-                      int n)
+static void hmac_isal_multi_phase(
+    ISAL_SHA256_HASH_CTX_MGR       *mgr,
+    ISAL_SHA256_HASH_CTX            ctxs[],
+    const uint8_t                  *first_block,
+    const uint8_t *const           *data,
+    const uint32_t                 *data_lens,
+    uint8_t                         digests[][HMAC_ISAL_DIGEST_SIZE],
+    int                             n)
 {
+    int              remaining = n;
+    ISAL_SHA256_HASH_CTX *done = NULL;
+
+    /* Initialise all contexts and tag each with its index. */
     for (int i = 0; i < n; i++) {
-        sha256_mb_update(mb, first_block, HMAC_ISAL_BLOCK_SIZE, i);
-        if (lens[i] > 0)
-            sha256_mb_update(mb, data[i], lens[i], i);
+        isal_hash_ctx_init(&ctxs[i]);
+        ctxs[i].user_data = (void *)(intptr_t)i;
+    }
+
+    /* Phase A: submit the first (padding) block for every packet. */
+    for (int i = 0; i < n; i++)
+        isal_sha256_ctx_mgr_submit(mgr, &ctxs[i], &done,
+                                   first_block, HMAC_ISAL_BLOCK_SIZE,
+                                   ISAL_HASH_FIRST);
+
+    /* Phase B: submit the remaining data (LAST) for every packet.
+     * The submit function may return a (possibly different) completed
+     * job via @done; collect it immediately. */
+    for (int i = 0; i < n && remaining > 0; i++) {
+        isal_sha256_ctx_mgr_submit(mgr, &ctxs[i], &done,
+                                   data[i], data_lens[i],
+                                   ISAL_HASH_LAST);
+        if (done) {
+            int idx = (int)(intptr_t)done->user_data;
+            memcpy(digests[idx], isal_hash_ctx_digest(done),
+                   HMAC_ISAL_DIGEST_SIZE);
+            remaining--;
+            done = NULL;
+        }
+    }
+
+    /* Phase C: flush any stragglers. */
+    while (remaining > 0) {
+        isal_sha256_ctx_mgr_flush(mgr, &done);
+        if (done) {
+            int idx = (int)(intptr_t)done->user_data;
+            memcpy(digests[idx], isal_hash_ctx_digest(done),
+                   HMAC_ISAL_DIGEST_SIZE);
+            remaining--;
+            done = NULL;
+        }
     }
 }
 
@@ -169,10 +229,10 @@ hmac_isal_multi(const uint8_t *key, size_t key_len,
     if (num_packets < 1)
         return 0;
 
-    uint8_t ipad[HMAC_ISAL_BLOCK_SIZE];
-    uint8_t opad[HMAC_ISAL_BLOCK_SIZE];
-    const uint8_t *ipad_ptr;
-    const uint8_t *opad_ptr;
+    uint8_t         ipad[HMAC_ISAL_BLOCK_SIZE];
+    uint8_t         opad[HMAC_ISAL_BLOCK_SIZE];
+    const uint8_t  *ipad_ptr;
+    const uint8_t  *opad_ptr;
 
     if (cache) {
         ipad_ptr = cache->ipad;
@@ -190,42 +250,38 @@ hmac_isal_multi(const uint8_t *key, size_t key_len,
         if (batch > HMAC_ISAL_MAX_BATCH)
             batch = HMAC_ISAL_MAX_BATCH;
 
-        const uint8_t *batch_msgs[HMAC_ISAL_MAX_BATCH];
-        size_t        batch_lens[HMAC_ISAL_MAX_BATCH];
-        uint8_t      *batch_macs[HMAC_ISAL_MAX_BATCH];
-
-        for (int i = 0; i < batch; i++) {
-            batch_msgs[i] = msgs[processed + i];
-            batch_lens[i] = msg_lens[processed + i];
-            batch_macs[i] = macs[processed + i];
-        }
-
-        /* ---- phase 1: compute inner hashes in parallel ---- */
+        /* ---------- inner hashes ---------- */
+        ISAL_SHA256_HASH_CTX inner_ctx[HMAC_ISAL_MAX_BATCH] ALIGNED16;
         uint8_t inner[HMAC_ISAL_MAX_BATCH][HMAC_ISAL_DIGEST_SIZE];
+        ISAL_SHA256_HASH_CTX_MGR mgr;
 
-        {
-            SHA256_MB_CTX mb;
-            sha256_mb_init(&mb);
-            mb_submit(&mb, ipad_ptr, batch_msgs, batch_lens, batch);
-            for (int i = 0; i < batch; i++)
-                sha256_mb_final(inner[i], &mb, i);
+        isal_sha256_ctx_mgr_init(&mgr);
+
+        /* Build per-packet data arrays for the multi-buffer submit loop */
+        const uint8_t *inner_data[HMAC_ISAL_MAX_BATCH];
+        uint32_t       inner_lens[HMAC_ISAL_MAX_BATCH];
+        for (int i = 0; i < batch; i++) {
+            inner_data[i] = msgs[processed + i];
+            inner_lens[i] = (uint32_t)msg_lens[processed + i];
         }
 
-        /* ---- phase 2: compute outer hashes in parallel ---- */
-        {
-            SHA256_MB_CTX mb;
-            const uint8_t *inner_ptrs[HMAC_ISAL_MAX_BATCH];
-            size_t        inner_lens[HMAC_ISAL_MAX_BATCH];
+        hmac_isal_multi_phase(&mgr, inner_ctx,
+                              ipad_ptr, inner_data, inner_lens,
+                              inner, batch);
 
-            sha256_mb_init(&mb);
-            for (int i = 0; i < batch; i++) {
-                inner_ptrs[i] = inner[i];
-                inner_lens[i] = HMAC_ISAL_DIGEST_SIZE;
-            }
-            mb_submit(&mb, opad_ptr, inner_ptrs, inner_lens, batch);
-            for (int i = 0; i < batch; i++)
-                sha256_mb_final(batch_macs[i], &mb, i);
+        /* ---------- outer hashes ---------- */
+        ISAL_SHA256_HASH_CTX outer_ctx[HMAC_ISAL_MAX_BATCH] ALIGNED16;
+        const uint8_t *outer_data[HMAC_ISAL_MAX_BATCH];
+        uint32_t       outer_lens[HMAC_ISAL_MAX_BATCH];
+        for (int i = 0; i < batch; i++) {
+            outer_data[i] = inner[i];
+            outer_lens[i] = HMAC_ISAL_DIGEST_SIZE;
         }
+
+        hmac_isal_multi_phase(&mgr, outer_ctx,
+                              opad_ptr, outer_data, outer_lens,
+                              (uint8_t (*)[HMAC_ISAL_DIGEST_SIZE])macs + processed,
+                              batch);
 
         processed += batch;
     }

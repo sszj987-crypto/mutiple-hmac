@@ -1,17 +1,25 @@
 # hmac-isal
 
-SIMD-accelerated HMAC-SHA256 with key caching, built on Intel(R) ISA-L_crypto.
+SIMD-accelerated HMAC-SHA256 with key caching, built on the Intel(R) ISA-L
+multi-buffer SHA256 context-manager API.
 
 ## Overview
 
 This library provides high-performance HMAC-SHA256 computation using the
-SIMD-optimised SHA256 implementations in the [Intel ISA-L_crypto][isa-l-crypto]
-library.  Two SHA256 backends are used:
+SIMD-optimised SHA256 implementation in the [Intel ISA-L_crypto][isa-l-crypto]
+library.  Both single-packet and multi-packet HMAC are built on the same
+multi-buffer context manager API (`isal_sha256_ctx_mgr_*`), which
+auto-dispatches to the widest SIMD lane width available on the CPU:
 
-| Backend    | Description                                   | Used for                        |
-|------------|-----------------------------------------------|---------------------------------|
-| `sha256_ni` | Single-buffer SHA256 (SHA-NI instructions)   | Per-packet HMAC                 |
-| `sha256_mb` | Multi-buffer SHA256 (up to 8 streams via SIMD) | Parallel multi-packet HMAC    |
+| ISA        | Lanes | Typical hardware          |
+|------------|-------|---------------------------|
+| SSE4       | 4     | Older x86_64 CPUs         |
+| AVX2       | 8     | Haswell and later         |
+| AVX-512    | 16    | Skylake-SP and later      |
+
+The key cache stores the pre-computed ipad/opad byte arrays so the key
+expansion step (RFC 2104) is not repeated when the same key is used across
+many messages.
 
 ## Key caching
 
@@ -20,11 +28,11 @@ message data:
 
     HMAC(K, m) = SHA256( (K' XOR opad) || SHA256( (K' XOR ipad) || m ) )
 
-When the same key is used repeatedly, this library caches the two SHA256
-intermediate states right after the ipad/opad blocks have been consumed.
-Subsequent HMAC calls restore those states and skip two block compressions
-per HMAC — a meaningful saving when processing many short messages with a
-shared key.
+When the same key is used repeatedly, this library caches the pre-computed
+ipad and opad byte arrays (`K' XOR ipad` and `K' XOR opad`).  For
+single-packet calls this saves the XOR and (if applicable) key-hash
+computation.  For multi-packet calls the saving is multiplied by the batch
+size.
 
 ## API
 
@@ -36,9 +44,9 @@ hmac_isal_key_cache_t *hmac_isal_key_cache_create(const uint8_t *key,
 void hmac_isal_key_cache_destroy(hmac_isal_key_cache_t *cache);
 ```
 
-Create a cache object that stores the SHA256 context after processing the
-ipad and opad blocks derived from `key`.  If `key_len > 64` the key is
-hashed down first (per RFC 2104).
+Create a cache object that stores the pre-computed ipad and opad bytes
+derived from `key`.  If `key_len > 64` the key is hashed down first
+(per RFC 2104).
 
 ### Single-packet HMAC
 
@@ -50,8 +58,7 @@ void hmac_isal_single(const uint8_t *key, size_t key_len,
 ```
 
 Compute `HMAC(key, msg)`.  If `cache` is non-NULL, the cached ipad/opad
-states are reused, saving two SHA256 block compressions.  The caller is
-responsible for ensuring the cache matches the key.
+bytes are reused, avoiding a per-call key expansion.
 
 ### Multi-packet HMAC
 
@@ -64,8 +71,8 @@ int hmac_isal_multi(const uint8_t *key, size_t key_len,
 
 Compute HMAC for `num_packets` messages in a single call.  The inner
 hashes are computed in parallel using the multi-buffer SHA256 engine; the
-outer hashes are computed in parallel in a second pass.  Large batches
-are internally split into groups of 8.
+outer hashes are computed in parallel in a second pass.  Batches larger
+than 16 are split automatically.
 
 If `cache` is provided, the pre-computed ipad/opad bytes are used instead
 of expanding the key on every call.
@@ -118,7 +125,7 @@ The test suite covers:
 - Key longer than the SHA256 block size (64 bytes)
 - Empty message
 - 1-byte key and exactly-64-byte key boundaries
-- Multi-packet parallel HMAC (3 packets in one call)
+- Multi-packet parallel HMAC (batches up to 17 packets)
 - Verify-reject of a forged MAC
 
 ## License
