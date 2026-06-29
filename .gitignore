@@ -31,3 +31,11 @@ test/test_hmac
 # Generated
 *.o.d
 *.dSYM/
+
+# ISA-L crypto (vendored source + build)
+isa-l_crypto/
+isa-l_crypto_build/
+
+# Test artifacts
+test/test_hmac_openssl
+*.bak

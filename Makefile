@@ -3,21 +3,20 @@
 # Makefile for hmac-isal — SIMD-accelerated HMAC-SHA256 with key caching
 #
 # Dependencies:
-#   - Intel(R) ISA-L_crypto (libisal_crypto.a / libisal_crypto.so)
+#   - Intel(R) ISA-L_crypto (libisal_crypto)
+#   - OpenSSL (libcrypto) — for tests and non-x86 fallback
 #
 # Variables the caller may override:
 #   CC       — C compiler (default: cc)
 #   CFLAGS   — compiler flags
 #   LDFLAGS  — linker flags
 #   ISA_L_CRYPTO_PATH — root of isa-l_crypto install (optional)
-#   OPENSSL_PATH      — root of OpenSSL install (optional, for test-openssl);
+#   OPENSSL_PATH      — root of OpenSSL install (optional);
 #                       auto-detected via brew on macOS
-#
-# If ISA_L_CRYPTO_PATH is set, the Makefile adds -I$(ISA_L_CRYPTO_PATH)/include
-# and -L$(ISA_L_CRYPTO_PATH)/lib.  Similarly for OPENSSL_PATH.
 
 CC       ?= cc
 CFLAGS   ?= -O2 -Wall -Wextra -Wpedantic -std=c99
+ISA_L_CRYPTO_PATH ?= ./isa-l_crypto_build
 AR       ?= ar
 ARFLAGS  ?= rcs
 
@@ -28,16 +27,15 @@ BUILD_DIR := build
 
 LIB      := $(BUILD_DIR)/libhmac_isal.a
 TEST_BIN := $(TEST_DIR)/test_hmac
-TEST_OPENSSL_BIN := $(TEST_DIR)/test_hmac_openssl
 
 SRCS     := $(SRC_DIR)/hmac_isal.c
 OBJS     := $(BUILD_DIR)/hmac_isal.o
 
-.PHONY: all lib test test-openssl clean
+.PHONY: all lib test clean
 
 all: lib
 
-# ---- optional isa-l_crypto path ----
+# ---- ISA-L crypto path ----
 
 ifdef ISA_L_CRYPTO_PATH
 CFLAGS  += -I$(ISA_L_CRYPTO_PATH)/include
@@ -46,8 +44,9 @@ endif
 
 CFLAGS  += -I$(INC_DIR)
 LDFLAGS += -lisal_crypto
+LDFLAGS += -Wl,-rpath,$(ISA_L_CRYPTO_PATH)/lib
 
-# ---- optional OpenSSL path ----
+# ---- OpenSSL path ----
 
 ifdef OPENSSL_PATH
 OPENSSL_CFLAGS := -I$(OPENSSL_PATH)/include
@@ -67,7 +66,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/hmac_isal.o: $(SRC_DIR)/hmac_isal.c $(INC_DIR)/hmac_isal.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -c -o $@ $<
 
 $(LIB): $(OBJS)
 	$(AR) $(ARFLAGS) $@ $^
@@ -78,26 +77,14 @@ test: lib $(TEST_BIN)
 	$(TEST_BIN)
 
 $(TEST_DIR)/test_hmac.o: $(TEST_DIR)/test_hmac.c $(INC_DIR)/hmac_isal.h
-	$(CC) $(CFLAGS) -I$(INC_DIR) -c -o $@ $<
+	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -I$(INC_DIR) -c -o $@ $<
 
 $(TEST_BIN): $(TEST_DIR)/test_hmac.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-# ---- test with OpenSSL cross-validation ----
-
-test-openssl: lib $(TEST_OPENSSL_BIN)
-	$(TEST_OPENSSL_BIN)
-
-$(TEST_DIR)/test_hmac_openssl.o: $(TEST_DIR)/test_hmac.c $(INC_DIR)/hmac_isal.h
-	$(CC) $(CFLAGS) $(OPENSSL_CFLAGS) -DHMAC_ISAL_HAVE_OPENSSL -I$(INC_DIR) -c -o $@ $<
-
-$(TEST_OPENSSL_BIN): $(TEST_DIR)/test_hmac_openssl.o $(LIB)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENSSL_LDFLAGS)
 
 # ---- clean ----
 
 clean:
 	rm -rf $(BUILD_DIR) $(TEST_BIN) $(TEST_DIR)/test_hmac.o
-	rm -f $(TEST_OPENSSL_BIN) $(TEST_DIR)/test_hmac_openssl.o
 
 .DEFAULT_GOAL := all

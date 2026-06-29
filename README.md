@@ -1,38 +1,36 @@
 # hmac-isal
 
-SIMD-accelerated HMAC-SHA256 with key caching, built on the Intel(R) ISA-L
-multi-buffer SHA256 context-manager API.
+SIMD-accelerated HMAC-SHA256 with key caching, built on Intel ISA-L crypto.
+Falls back to OpenSSL EVP on non-x86 architectures (arm64, RISC-V, etc.) for
+portable correctness across all platforms.
 
 ## Overview
-
-This library provides high-performance HMAC-SHA256 computation using the
-SIMD-optimised SHA256 implementation in the [Intel ISA-L_crypto][isa-l-crypto]
-library.  Both single-packet and multi-packet HMAC are built on the same
-multi-buffer context manager API (`isal_sha256_ctx_mgr_*`), which
-auto-dispatches to the widest SIMD lane width available on the CPU:
-
-| ISA        | Lanes | Typical hardware          |
-|------------|-------|---------------------------|
-| SSE4       | 4     | Older x86_64 CPUs         |
-| AVX2       | 8     | Haswell and later         |
-| AVX-512    | 16    | Skylake-SP and later      |
-
-The key cache stores the pre-computed ipad/opad byte arrays so the key
-expansion step (RFC 2104) is not repeated when the same key is used across
-many messages.
-
-## Key caching
 
 HMAC-SHA256 expands the key into two 64-byte blocks before hashing the
 message data:
 
     HMAC(K, m) = SHA256( (K' XOR opad) || SHA256( (K' XOR ipad) || m ) )
 
-When the same key is used repeatedly, this library caches the pre-computed
-ipad and opad byte arrays (`K' XOR ipad` and `K' XOR opad`).  For
-single-packet calls this saves the XOR and (if applicable) key-hash
-computation.  For multi-packet calls the saving is multiplied by the batch
-size.
+When the same key is used repeatedly, the **key cache** stores the
+pre-computed ipad and opad byte arrays, saving the per-call key expansion.
+
+### Backend dispatch
+
+| Architecture | Backend                                            |
+|-------------|----------------------------------------------------|
+| x86_64      | Intel ISA-L multi-buffer SHA256 (SIMD accelerated) |
+| arm64       | OpenSSL EVP SHA256 (portable fallback)             |
+| other       | OpenSSL EVP SHA256 (portable fallback)             |
+
+On x86_64, the ISA-L backend uses the multi-buffer context manager API
+(`isal_sha256_ctx_mgr_*`) which auto-dispatches to the widest SIMD lane
+width available:
+
+| ISA        | Lanes | Typical hardware          |
+|------------|-------|---------------------------|
+| SSE4       | 4     | Older x86_64 CPUs         |
+| AVX2       | 8     | Haswell and later         |
+| AVX-512    | 16    | Skylake-SP and later      |
 
 ## API
 
@@ -44,9 +42,7 @@ hmac_isal_key_cache_t *hmac_isal_key_cache_create(const uint8_t *key,
 void hmac_isal_key_cache_destroy(hmac_isal_key_cache_t *cache);
 ```
 
-Create a cache object that stores the pre-computed ipad and opad bytes
-derived from `key`.  If `key_len > 64` the key is hashed down first
-(per RFC 2104).
+If `key_len > 64` the key is hashed down first (per RFC 2104).
 
 ### Single-packet HMAC
 
@@ -57,8 +53,7 @@ void hmac_isal_single(const uint8_t *key, size_t key_len,
                       const hmac_isal_key_cache_t *cache);
 ```
 
-Compute `HMAC(key, msg)`.  If `cache` is non-NULL, the cached ipad/opad
-bytes are reused, avoiding a per-call key expansion.
+Compute `HMAC(key, msg)`.  Pass `cache` to reuse pre-computed ipad/opad.
 
 ### Multi-packet HMAC
 
@@ -69,13 +64,10 @@ int hmac_isal_multi(const uint8_t *key, size_t key_len,
                     const hmac_isal_key_cache_t *cache);
 ```
 
-Compute HMAC for `num_packets` messages in a single call.  The inner
-hashes are computed in parallel using the multi-buffer SHA256 engine; the
-outer hashes are computed in parallel in a second pass.  Batches larger
-than 16 are split automatically.
-
-If `cache` is provided, the pre-computed ipad/opad bytes are used instead
-of expanding the key on every call.
+Compute HMAC for `num_packets` messages in a single call.  Inner and outer
+hashes are each processed in parallel through the multi-buffer engine.
+Batches larger than 16 are split automatically.  Returns `num_packets` on
+success.
 
 ### Verification (constant-time)
 
@@ -86,15 +78,39 @@ int hmac_isal_verify_single(const uint8_t *key, size_t key_len,
                             const hmac_isal_key_cache_t *cache);
 ```
 
-Returns 0 if `mac` matches, nonzero otherwise.  The comparison is
-constant-time to resist timing side-channels.
+Returns 0 if `mac` matches HMAC(key, msg), nonzero otherwise.
+
+```c
+uint64_t hmac_isal_verify_multi(const uint8_t *key, size_t key_len,
+                                const uint8_t *msgs[], const size_t msg_lens[],
+                                const uint8_t *macs[], int num_packets,
+                                const hmac_isal_key_cache_t *cache);
+```
+
+Returns a **bitmask** where bit *i* (LSB = packet 0) is set when `macs[i]`
+does **not** match `HMAC(key, msgs[i])`.  A return value of 0 means all
+packets verified successfully.  The caller can inspect individual bits:
+
+```c
+uint64_t bad = hmac_isal_verify_multi(key, klen, msgs, lens, macs, n, NULL);
+if (bad) {
+    for (int i = 0; i < n; i++)
+        if (bad & ((uint64_t)1 << i))
+            handle_bad_packet(i);
+}
+```
+
+All comparisons are constant-time.
 
 ## Building
 
 ### Prerequisites
 
-- [Intel ISA-L_crypto][isa-l-crypto] (v2.x or later)
-- A C99 compiler (gcc, clang)
+- C99 compiler (gcc, clang)
+- [Intel ISA-L_crypto][isa-l-crypto] — the Makefile defaults to `./isa-l_crypto_build/`,
+  a local build of the ISA-L library.  Override with `ISA_L_CRYPTO_PATH`.
+- OpenSSL (libcrypto) — for tests and non-x86 fallback.  Auto-detected
+  via Homebrew on macOS.
 
 ### Build the library
 
@@ -102,7 +118,7 @@ constant-time to resist timing side-channels.
 make
 ```
 
-If ISA-L_crypto is installed in a non-standard location:
+Override ISA-L location if needed:
 
 ```sh
 make ISA_L_CRYPTO_PATH=/path/to/isa-l_crypto
@@ -111,22 +127,20 @@ make ISA_L_CRYPTO_PATH=/path/to/isa-l_crypto
 ### Run tests
 
 ```sh
-make test
+make test              # RFC 4231 vectors + multi-packet + large batch
+make test-openssl      # above + OpenSSL cross-validation
 ```
-
-The test suite exercises every test vector through both the cached and
-non-cached code paths and verifies constant-time comparison logic.
-
-## Test vectors
 
 The test suite covers:
 
 - RFC 4231 Test Cases 2–7 (standard HMAC-SHA256 vectors)
-- Key longer than the SHA256 block size (64 bytes)
-- Empty message
-- 1-byte key and exactly-64-byte key boundaries
-- Multi-packet parallel HMAC (batches up to 17 packets)
-- Verify-reject of a forged MAC
+- Keys longer than the block size (64 bytes), requiring hash-down
+- Multi-packet HMAC (batches of 3, 17-packets spanning >1 internal batch)
+- Key cache correctness on all paths
+- `verify_single` — valid MAC accepted, forged MAC rejected
+- `verify_multi` — valid MACs return 0, single forged MAC sets exactly the correct bit
+- OpenSSL cross-validation — every RFC vector and multi-packet result
+  compared against the reference `HMAC()` implementation
 
 ## License
 
